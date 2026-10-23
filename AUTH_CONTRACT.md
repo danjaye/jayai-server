@@ -28,6 +28,10 @@ Never log, cache, or persist passwords/codes/tokens beyond the immediate flow.
 - `POST /api/auth/resend` `{ username }`
   → always `200 { ok: true }` (sends a fresh code only if an unverified
   account with that username exists — no enumeration).
+- `POST /api/auth/check` `{ username }`
+  → `200 { available: true/false }`; `400` on bad shape; `429` past
+  120/min per IP. For live keystroke validation (debounced + aborted
+  client-side). No new enumeration: register already reveals taken usernames.
 - `POST /api/auth/login` `{ username, password }`
   → `200 { code }`; `401 { error: "invalid credentials" }` (generic);
   `403 { error: "email not verified", needsVerification: true }` when the

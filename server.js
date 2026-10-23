@@ -21,6 +21,7 @@
 //   GET  /api/auth/me  (Bearer)                                  -> { username, email, createdAt }
 //   POST /api/auth/logout (Bearer)                               -> { ok }
 //   Full shapes + rules: AUTH_CONTRACT.md.
+//   POST /api/auth/check {username}                                    -> { available } (live availability)
 //   GET /api/sync/:collection                                     -> { items: [{ id, rev, updatedAt, bytes, deleted? }] }
 //   GET /api/sync/:collection/:id                                -> { id, rev, updatedAt, data }
 //   PUT /api/sync/:collection/:id { updatedAt, data, baseRev? }   -> { id, rev } (+ conflict flag)
@@ -551,6 +552,7 @@ function makeLimiter() { const m = new Map(); rlMaps.push(m); return m; }
 const rlLoginIp = makeLimiter(), rlLoginUser = makeLimiter(), rlLoginFail = makeLimiter();
 const rlRegister = makeLimiter(), rlVerify = makeLimiter(), rlExchange = makeLimiter();
 const rlRecoverIp = makeLimiter(), rlRecoverEmail = makeLimiter(), rlResend = makeLimiter();
+const rlCheck = makeLimiter();
 function allow(map, key, limit, windowMs) {
   const now = Date.now();
   let arr = map.get(key) || [];
@@ -738,6 +740,7 @@ async function handleAuth(req, res, url) {
     if (p === "/api/auth/recover") return await authRecover(res, body, req);
     if (p === "/api/auth/reset") return await authReset(res, body, req);
     if (p === "/api/auth/exchange") return await authExchange(res, body, req);
+    if (p === "/api/auth/check") return await authCheck(res, body, req);
     return send(res, 404, { error: "not found" });
   } catch (e) {
     return send(res, (e && e.status) || 500, {
@@ -778,6 +781,14 @@ async function authVerify(res, body, req) {
   }
   authDb.prepare("UPDATE users SET verified=1 WHERE id=?").run(u.id);
   return send(res, 200, { code: issueLoginCode(u.id) });
+}
+
+async function authCheck(res, body, req) {
+  const ip = req.socket.remoteAddress || "x";
+  if (!allow(rlCheck, ip, 120, 60000)) return send(res, 429, { error: "rate limited" });
+  const username = String(body.username || "").trim().toLowerCase();
+  if (!validUsername(username)) return send(res, 400, { error: "bad username (3-20 chars: a-z 0-9 _ -)" });
+  return send(res, 200, { available: !dbGetUserByUsername(username) });
 }
 
 async function authResend(res, body, req) {

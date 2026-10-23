@@ -63,6 +63,9 @@ codes are hashed, passwords are scrypt-hashed.
 
 ```bash
 BASE=https://jayai.danjaye.lol
+# 0. availability check (used by live keystroke validation + login gate)
+curl -s -X POST $BASE/api/auth/check -H 'Content-Type: application/json' \
+  -d '{"username":"alice"}'
 # 1. register (sends the 6-digit code to the email)
 curl -s -X POST $BASE/api/auth/register -H 'Content-Type: application/json' \
   -d '{"username":"alice","email":"alice@example.com","password":"correct-horse-10"}'
