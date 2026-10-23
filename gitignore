@@ -1,0 +1,17 @@
+# Real secrets — never commit (use .env.example as the template)
+.env
+
+# Dependencies
+node_modules/
+
+# SQLite database + journals (production data lives on the box, not in git)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Minified one-line deploy builds (regenerate with esbuild when needed)
+server.one-line.js
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
