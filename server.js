@@ -20,7 +20,12 @@
 //   POST /api/auth/exchange {code}                               -> { token, username }
 //   GET  /api/auth/me  (Bearer)                                  -> { username, email, createdAt }
 //   POST /api/auth/logout (Bearer)                               -> { ok }
-// Full shapes + rules: AUTH_CONTRACT.md.
+//   Full shapes + rules: AUTH_CONTRACT.md.
+//   GET /api/sync/:collection                                     -> { items: [{ id, rev, updatedAt, bytes, deleted? }] }
+//   GET /api/sync/:collection/:id                                -> { id, rev, updatedAt, data }
+//   PUT /api/sync/:collection/:id { updatedAt, data, baseRev? }   -> { id, rev } (+ conflict flag)
+//   DELETE /api/sync/:collection/:id (memories only)             -> { id, rev, deleted }
+//   Full shapes + rules: SYNC_CONTRACT.md.
 //
 // Env (or .env file — see .env.example; process.env wins):
 //   PORT            default 3000
@@ -585,7 +590,14 @@ function openAuthDb() {
     "CREATE TABLE IF NOT EXISTS tokens(" +
     "id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL " +
     "REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, " +
-    "revoked INTEGER NOT NULL DEFAULT 0);"
+    "revoked INTEGER NOT NULL DEFAULT 0);" +
+    "CREATE TABLE IF NOT EXISTS blobs(" +
+    "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, " +
+    "collection TEXT NOT NULL, blob_id TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 1, " +
+    "updated_at INTEGER NOT NULL, bytes INTEGER NOT NULL, data TEXT NOT NULL, " +
+    "deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, " +
+    "UNIQUE(user_id, collection, blob_id));" +
+    "CREATE INDEX IF NOT EXISTS idx_blobs_user ON blobs(user_id, collection);"
   );
 }
 function dbTx(fn) {
@@ -837,6 +849,134 @@ async function authExchange(res, body, req) {
   return send(res, 200, { token: issueToken(u.id), username: u.username });
 }
 
+// ---- jay-ai cross-device sync (v1; contract: SYNC_CONTRACT.md) ----
+// Blob sync for chats / memories / settings behind the existing Bearer tokens.
+// Server is the backup + relay: per-blob revs, baseRev conflict flags, last-write-wins.
+// Merge rules themselves run client-side. Strict per-user isolation on every query.
+
+const SYNC_COLLECTIONS = {
+  chats: { maxBytes: 5 * 1024 * 1024 },
+  memories: { maxBytes: 200 * 1024 },
+  settings: { maxBytes: 100 * 1024 },
+};
+const SYNC_QUOTA_BYTES = (parseInt(process.env.SYNC_QUOTA_MB || "50", 10) || 50) * 1024 * 1024;
+const TOMBSTONE_GC_MS = 30 * 86400 * 1000;
+const SYNC_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const rlSyncRead = makeLimiter(), rlSyncWrite = makeLimiter();
+
+function syncQuotaUsed(userId) {
+  const row = authDb.prepare("SELECT COALESCE(SUM(bytes),0) AS total FROM blobs WHERE user_id=?").get(userId);
+  return (row && row.total) || 0;
+}
+
+function parseSyncPath(pathname) {
+  const parts = pathname.split("/").filter(function (s) { return s.length; });
+  // ["api","sync"] | ["api","sync",collection] | ["api","sync",collection,id]
+  if (parts.length < 2 || parts[0] !== "api" || parts[1] !== "sync") return null;
+  if (parts.length === 2) return { collection: null, id: null };
+  if (parts.length === 3) return { collection: parts[2], id: null };
+  let id;
+  try { id = decodeURIComponent(parts.slice(3).join("/")); } catch (e) { return { collection: parts[2], id: "" }; }
+  return { collection: parts[2], id: id };
+}
+
+async function handleSync(req, res, url) {
+  try {
+    const u = getBearerUser(req);
+    if (!u) return send(res, 401, { error: "unauthorized" });
+    const p = parseSyncPath(url.pathname);
+    if (!p || !(p.collection in SYNC_COLLECTIONS)) return send(res, 404, { error: "unknown collection" });
+    if (p.id !== null && !SYNC_ID_RE.test(p.id)) return send(res, 400, { error: "bad id" });
+    if (p.collection === "settings" && p.id !== null && p.id !== "main") {
+      return send(res, 400, { error: 'settings id must be "main"' });
+    }
+    if (req.method === "GET" && p.id === null) {
+      if (!allow(rlSyncRead, "sr:" + u.id, 60, 60000)) return send(res, 429, { error: "rate limited" });
+      const rows = authDb.prepare(
+        "SELECT blob_id AS id, rev, updated_at AS updatedAt, bytes, deleted FROM blobs " +
+        "WHERE user_id=? AND collection=? ORDER BY blob_id").all(u.id, p.collection);
+      return send(res, 200, { items: rows.map(function (r) {
+        const it = { id: r.id, rev: r.rev, updatedAt: r.updatedAt, bytes: r.bytes };
+        if (r.deleted) it.deleted = true;
+        return it;
+      }) });
+    }
+    if (req.method === "GET") {
+      if (!allow(rlSyncRead, "sr:" + u.id, 60, 60000)) return send(res, 429, { error: "rate limited" });
+      const row = authDb.prepare("SELECT * FROM blobs WHERE user_id=? AND collection=? AND blob_id=?")
+        .get(u.id, p.collection, p.id);
+      if (!row) return send(res, 404, { error: "not found" });
+      let data;
+      try { data = JSON.parse(row.data); } catch (e) { return send(res, 500, { error: "internal" }); }
+      const out = { id: row.blob_id, rev: row.rev, updatedAt: row.updated_at, data: data };
+      if (row.deleted) out.deleted = true;
+      return send(res, 200, out);
+    }
+    if (req.method === "PUT" && p.id !== null) {
+      if (!allow(rlSyncWrite, "sw:" + u.id, 20, 60000)) return send(res, 429, { error: "rate limited" });
+      const cap = SYNC_COLLECTIONS[p.collection].maxBytes;
+      const body = await readJsonBody(req, cap + 65536);
+      if (typeof body.updatedAt !== "number" || !(body.updatedAt > 0)) {
+        return send(res, 400, { error: "bad updatedAt" });
+      }
+      if (!body.data || typeof body.data !== "object" || Array.isArray(body.data)) {
+        return send(res, 400, { error: "bad data" });
+      }
+      const raw = JSON.stringify(body.data);
+      const bytes = Buffer.byteLength(raw);
+      if (bytes > cap) return send(res, 409, { error: "blob too large" });
+      const baseRev = (body.baseRev === undefined || body.baseRev === null) ? null : body.baseRev;
+      if (baseRev !== null && (!Number.isInteger(baseRev) || baseRev < 1)) {
+        return send(res, 400, { error: "bad baseRev" });
+      }
+      const out = dbTx(function () {
+        const existing = authDb.prepare("SELECT * FROM blobs WHERE user_id=? AND collection=? AND blob_id=?")
+          .get(u.id, p.collection, p.id);
+        const oldBytes = existing ? existing.bytes : 0;
+        if (syncQuotaUsed(u.id) - oldBytes + bytes > SYNC_QUOTA_BYTES) throw fail(413, "quota exceeded");
+        const rev = existing ? existing.rev + 1 : 1;
+        if (existing) {
+          authDb.prepare("UPDATE blobs SET rev=?, updated_at=?, bytes=?, data=?, deleted=0 WHERE id=?")
+            .run(rev, body.updatedAt, bytes, raw, existing.id);
+        } else {
+          authDb.prepare("INSERT INTO blobs(user_id, collection, blob_id, rev, updated_at, bytes, data, deleted, created_at) VALUES(?,?,?,?,?,?,?,0,?)")
+            .run(u.id, p.collection, p.id, rev, body.updatedAt, bytes, raw, Date.now());
+        }
+        const result = { id: p.id, rev: rev };
+        if (baseRev !== null && existing && baseRev !== existing.rev) {
+          result.conflict = true;
+          result.server = { rev: rev, updatedAt: body.updatedAt };
+        }
+        return result;
+      });
+      return send(res, 200, out);
+    }
+    if (req.method === "DELETE" && p.id !== null) {
+      if (!allow(rlSyncWrite, "sw:" + u.id, 20, 60000)) return send(res, 429, { error: "rate limited" });
+      if (p.collection !== "memories") {
+        return send(res, 400, { error: "client never deletes " + p.collection + " in v1" });
+      }
+      const now = Date.now();
+      const out = dbTx(function () {
+        const existing = authDb.prepare("SELECT * FROM blobs WHERE user_id=? AND collection=? AND blob_id=?")
+          .get(u.id, p.collection, p.id);
+        if (!existing) throw fail(404, "not found");
+        const rev = existing.rev + 1;
+        const tomb = JSON.stringify({ path: "memories/" + p.id + ".md", deleted: true, updatedAt: now });
+        authDb.prepare("UPDATE blobs SET rev=?, updated_at=?, bytes=?, data=?, deleted=1 WHERE id=?")
+          .run(rev, now, Buffer.byteLength(tomb), tomb, existing.id);
+        return { id: p.id, rev: rev, deleted: true };
+      });
+      return send(res, 200, out);
+    }
+    return send(res, 405, { error: "method not allowed" });
+  } catch (e) {
+    return send(res, (e && e.status) || 500, {
+      error: (e && e.status) ? String(e.message).slice(0, 200) : "internal",
+    });
+  }
+}
+
 // Periodic cleanup: expired codes/tokens + pruned rate-limit maps.
 // (Also prunes the shared search/fetch `hits` map, which was previously unbounded.)
 function cleanupAuth() {
@@ -846,6 +986,7 @@ function cleanupAuth() {
       authDb.prepare("DELETE FROM login_codes WHERE expires_at < ?").run(now);
       authDb.prepare("DELETE FROM email_codes WHERE expires_at < ?").run(now);
       authDb.prepare("DELETE FROM tokens WHERE expires_at < ?").run(now);
+      authDb.prepare("DELETE FROM blobs WHERE deleted=1 AND updated_at < ?").run(now - TOMBSTONE_GC_MS);
     }
     for (const m of rlMaps) {
       const now = Date.now();
@@ -918,11 +1059,12 @@ async function handleRequest(e, t) {
       t.writeHead(204, {
         "Access-Control-Allow-Origin": ORIGIN,
         "Access-Control-Allow-Headers": "Authorization, Content-Type",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       }),
       t.end()
     );
   const r = new URL(e.url, "http://x");
+  if (r.pathname === "/api/sync" || r.pathname.indexOf("/api/sync/") === 0) return handleSync(e, t, r);
   if (r.pathname.indexOf("/api/auth/") === 0) return handleAuth(e, t, r);
   if ("/" === r.pathname)
     return (

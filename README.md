@@ -20,6 +20,8 @@ server.js --minify > server.one-line.js`) and send that separately.
   - `maxChars` default 12000, clamped to 500–50000.
 - `POST|GET /api/auth/*` — danauth email auth (v2). Full shapes, rules, and
   the login→app handoff flow: see `AUTH_CONTRACT.md`.
+- `GET|PUT|DELETE /api/sync/*` — cross-device blob sync for chats, memories,
+  settings (v1). Full shapes, merge rules, caps: see `SYNC_CONTRACT.md`.
 
 ## Setup (first time on the box)
 
@@ -82,6 +84,32 @@ curl -s -X POST $BASE/api/auth/reset -H 'Content-Type: application/json' \
 
 To test end-to-end without sending mail, set `ALLOW_NO_SMTP=1` in `.env`
 (dev only): email codes are logged to the server console instead of sent.
+
+## Sync smoke tests (needs a Bearer TOKEN from the auth smoke tests above)
+
+```bash
+TOKEN=PASTE_TOKEN
+# manifest (empty on a fresh account)
+curl -s $BASE/api/sync/chats -H "Authorization: Bearer $TOKEN"
+# push a settings blob -> { id: "main", rev: 1 }
+curl -s -X PUT $BASE/api/sync/settings/main -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"updatedAt": 1760000000000, "data": {"userName": "Al", "version": 1, "updatedAt": 1760000000000}}'
+# blind re-push -> rev bumps, no conflict
+curl -s -X PUT $BASE/api/sync/settings/main -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"updatedAt": 1760000000001, "data": {"userName": "Al2", "version": 2, "updatedAt": 1760000000001}}'
+# stale baseRev -> still writes, but conflict: true + server rev
+curl -s -X PUT $BASE/api/sync/settings/main -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"updatedAt": 1760000000002, "baseRev": 1, "data": {"userName": "Al3", "version": 3, "updatedAt": 1760000000002}}'
+# memories round-trip + tombstone
+curl -s -X PUT $BASE/api/sync/memories/foo-bar -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"updatedAt": 1760000000000, "data": {"path": "memories/foo-bar.md", "content": "hi", "updatedAt": 1760000000000}}'
+curl -s -X DELETE $BASE/api/sync/memories/foo-bar -H "Authorization: Bearer $TOKEN"
+# cross-user isolation: a second account's token must see empty manifests
+```
 
 ## Safety
 
