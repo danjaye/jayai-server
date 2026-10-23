@@ -1,7 +1,8 @@
-# jay-ai server API contract — danauth email auth (v2, IMPLEMENTED)
+# jay-ai server API contract — danauth email auth (v2.3, IMPLEMENTED)
 
 Base: `https://jayai.danjaye.lol`. All JSON. Errors: `{ "error": "..." }`.
-Server working copy: `src/server/server.js` in the app generator (and this folder).
+Server source of truth: https://github.com/danjaye/jayai-server
+(working copy in the app generator's `src/server/` may lag — the repo wins).
 
 ## Live now (unchanged — do not change shapes)
 
@@ -45,7 +46,8 @@ Never log, cache, or persist passwords/codes/tokens beyond the immediate flow.
   → `200 { token, username }`; `401`/`410 { error }` on bad/expired/used code.
   Codes are single-use, ~60s expiry.
 - `GET /api/auth/me` (`Authorization: Bearer <token>`)
-  → `200 { username, email, createdAt }`; `401` on bad token.
+  → `200 { username, email, verified, createdAt }`; `401` on bad token.
+  (`verified` added in v2.3; old clients ignore it.)
 - `POST /api/auth/logout` (Bearer) → `200 { ok: true }` (revokes token).
 
 Rules (enforced server-side; mirror client-side for UX):
@@ -59,6 +61,63 @@ Rules (enforced server-side; mirror client-side for UX):
 - rate limits: register 5/hr per IP; login 10/min per IP AND per username +
   15-min cool-down after 10 fails; verify/reset/exchange 30/min per IP;
   recover 10/hr per IP + 5/hr per email; resend 5/hr per username+IP.
+
+## Profile settings endpoints (v2.3 — IMPLEMENTED)
+
+Used by the **jay-ai settings UI**, which holds the Bearer token in
+`localStorage["jay-ai-auth-token"]` (the login generator never sees tokens,
+so settings live in the app, not in danauth). All endpoints require
+`Authorization: Bearer <token>` → `401 { error: "unauthorized" }` on a
+bad/expired/revoked token. All JSON, CORS `*`.
+
+- `POST /api/auth/password/change` `{ currentPassword, newPassword }`
+  → `200 { ok: true }`. Verifies the current password, sets the new one
+  (same 10–512 rule), and revokes all OTHER tokens — this device stays
+  signed in, other devices are signed out.
+  → `400` bad shape; `401` wrong current password; `429` past 10/hr.
+- `POST /api/auth/email/request` `{ newEmail, currentPassword }`
+  → `200 { ok: true }` + 6-digit confirmation code sent to the NEW address
+  (nothing changes yet; a new request invalidates any previous pending one).
+  → `400` bad shape / same-as-current; `401` wrong current password;
+  `409 { error: "email already registered" }`; `429` past 5/hr;
+  `502/503` if the confirmation email can't be sent.
+- `POST /api/auth/email/confirm` `{ code }`
+  → `200 { ok: true, email }` (swaps to the pending address, marks the
+  account verified — the new address proved deliverable).
+  → `400` missing code; `401` bad/expired/over-attempted code (6 digits,
+  10 min, 5 attempts, single-use, peppered hash — same as verify/reset);
+  `409` if the address got taken meanwhile (pending is dropped);
+  `429` past 30/min per IP.
+- `POST /api/auth/username/change` `{ newUsername, currentPassword }`
+  → `200 { ok: true, username }`. Same `a-z 0-9 _ -` 3–20 rule, must be
+  unused. Server keys everything by `user_id`, so blobs/tokens survive —
+  but the app MUST update `localStorage["jay-ai-username"]` after this call.
+  → `400` bad shape; `401` wrong current password;
+  `409 { error: "username taken" }`; `429` past 5/hr.
+- `POST /api/auth/delete` `{ password }`
+  → `200 { ok: true }`. Verifies the password, then deletes the user row —
+  blobs, tokens, codes, and pending email changes cascade (irreversible).
+  The client MUST wipe `localStorage` (token + username + sync state) after.
+  → `400` missing password; `401` wrong password; `429` past 5/hr.
+
+Rate limits (v2.3 additions): password change 10/hr per user; email request
+5/hr per user; email confirm 30/min per IP (shared `verify` bucket);
+username change 5/hr per user; account delete 5/hr per user.
+
+Client wiring (jay-ai settings screen):
+```js
+const API = "https://jayai.danjaye.lol";
+const token = localStorage.getItem("jay-ai-auth-token");
+const auth = (body) => fetch(API + "/api/auth/password/change", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+  body: JSON.stringify(body),
+}).then((r) => r.json().then((d) => ({ status: r.status, data: d })));
+// same shape for /email/request, /email/confirm, /username/change, /delete.
+// After a username change: localStorage.setItem("jay-ai-username", data.username).
+// After delete: localStorage.removeItem("jay-ai-auth-token");
+//   localStorage.removeItem("jay-ai-username"); (+ sync state) → signed-out UI.
+```
 
 ## Login → app handoff flow (v2)
 
@@ -79,3 +138,4 @@ Rules (enforced server-side; mirror client-side for UX):
 login (username → password) · register · verify-code (shared:
 registration + login-unverified) · recover-email · reset-new-password ·
 authorize (handoff). The verify-code screen serves both flows.
+Profile settings live in the APP (jay-ai), not here — see above.

@@ -1,9 +1,13 @@
 # jay-ai dedicated server
 
-Working copy of what runs at `https://jayai.danjaye.lol`. `server.js` is the
-prettified source of truth — never edit a minified one-liner directly. When a
-one-line deploy file is needed, minify this file (e.g. `npx esbuild
-server.js --minify > server.one-line.js`) and send that separately.
+Source of truth: https://github.com/danjaye/jayai-server (clone it on the
+box; deploy with `git pull` + restart — no build step).
+Live at `https://jayai.danjaye.lol`. Entry: `server.js` (thin boot +
+routing); logic lives in `lib/` (`config`, `util`, `browser`, `search`,
+`fetchPage`, `crypto`, `mailer`, `db`, `auth`, `sync`, `routes`, `cleanup`).
+When a one-line deploy file is needed, bundle the entry (e.g.
+`npx esbuild server.js --bundle --platform=node --minify > server.one-line.js`)
+and send that separately — never edit a one-liner directly.
 
 ## Endpoints
 
@@ -18,14 +22,18 @@ server.js --minify > server.one-line.js`) and send that separately.
     HTML looks like an unhydrated JS shell (thin text / app-mount markers).
   - `mode=raw`: static only. `mode=js`: always render.
   - `maxChars` default 12000, clamped to 500–50000.
-- `POST|GET /api/auth/*` — danauth email auth (v2). Full shapes, rules, and
-  the login→app handoff flow: see `AUTH_CONTRACT.md`.
+- `POST|GET /api/auth/*` — danauth email auth (v2) + profile settings
+  (v2.3: password/email/username change, account delete — Bearer-authed,
+  for the jay-ai settings UI). Full shapes, rules, and the login→app
+  handoff flow: see `AUTH_CONTRACT.md`.
 - `GET|PUT|DELETE /api/sync/*` — cross-device blob sync for chats, memories,
   settings (v1). Full shapes, merge rules, caps: see `SYNC_CONTRACT.md`.
 
 ## Setup (first time on the box)
 
 ```bash
+git clone https://github.com/danjaye/jayai-server.git
+cd jayai-server
 npm install
 npx playwright install chromium --with-deps   # needs root for --with-deps
 cp .env.example .env   # then fill in AUTH_PEPPER + SMTP_PASS (see below)
@@ -45,15 +53,25 @@ serves no static files, so `.env` is not reachable over HTTP — still, keep it
 ## Deploy
 
 ```bash
-PORT=3000 SEARCH_SECRET=... ALLOWED_ORIGIN=* node server.js
+cd jayai-server
+git pull
+npm install   # only needed when package.json changed
+node server.js
 ```
 
-(`.env` in the working dir covers all of the above; explicit env vars win.)
+(`.env` in the working dir covers `PORT`/`SEARCH_SECRET`/mail config;
+explicit env vars win, e.g. `PORT=3000 node server.js`.)
 If Node complains that `node:sqlite` needs `--experimental-sqlite`, start
 with `node --experimental-sqlite server.js` instead — harmless on versions
 where the flag is no longer needed. Existing deploy keeps working unchanged:
 `/api/search` behavior is identical, and old clients without `/api/fetch`
 fall back to `superFetch`.
+
+Upgrading to v2.3 from v2.2: just `git pull` + restart. The new
+`email_changes` table is created automatically (`CREATE TABLE IF NOT
+EXISTS`); no manual DB migration. v2.3 is backward-compatible: old
+search/fetch/auth/sync clients see identical shapes (`/api/auth/me` only
+gains an additive `verified` field).
 
 Auth storage is a single SQLite file (`AUTH_DB_PATH`, default
 `./danauth.sqlite`, WAL mode). Back it up like any database; tokens and
@@ -87,6 +105,33 @@ curl -s -X POST $BASE/api/auth/reset -H 'Content-Type: application/json' \
 
 To test end-to-end without sending mail, set `ALLOW_NO_SMTP=1` in `.env`
 (dev only): email codes are logged to the server console instead of sent.
+
+## Profile settings smoke tests (v2.3; needs a Bearer TOKEN)
+
+```bash
+TOKEN=PASTE_TOKEN
+# me now includes verified
+curl -s $BASE/api/auth/me -H "Authorization: Bearer $TOKEN"
+# password change (other devices are signed out, this token stays valid)
+curl -s -X POST $BASE/api/auth/password/change -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"currentPassword":"correct-horse-10","newPassword":"new-correct-horse-11"}'
+# email change: request (code goes to the NEW address) then confirm
+curl -s -X POST $BASE/api/auth/email/request -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"newEmail":"alice-new@example.com","currentPassword":"new-correct-horse-11"}'
+curl -s -X POST $BASE/api/auth/email/confirm -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"123456"}'
+# username change (update localStorage["jay-ai-username"] afterwards)
+curl -s -X POST $BASE/api/auth/username/change -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"newUsername":"alice2","currentPassword":"new-correct-horse-11"}'
+# delete account (irreversible; wipe localStorage after)
+# curl -s -X POST $BASE/api/auth/delete -H "Authorization: Bearer $TOKEN" \
+#   -H 'Content-Type: application/json' \
+#   -d '{"password":"new-correct-horse-11"}'
+```
 
 ## Sync smoke tests (needs a Bearer TOKEN from the auth smoke tests above)
 
@@ -128,6 +173,8 @@ curl -s -X DELETE $BASE/api/sync/memories/foo-bar -H "Authorization: Bearer $TOK
   attempts, single-use); 60s single-use handoff codes; 30-day revocable
   Bearer tokens; per-IP + per-account rate limits (see AUTH_CONTRACT.md).
   Generic error messages (no user enumeration beyond what register reveals).
+  Profile changes require the current password; password change revokes
+  other tokens; account delete wipes the whole user row (cascade).
 
 ## Troubleshooting
 
@@ -153,3 +200,8 @@ curl -s -X DELETE $BASE/api/sync/memories/foo-bar -H "Authorization: Bearer $TOK
 `localStorage["jay-ai-search-key"]`) and falls back to `superFetch` when the
 server is missing/old, denies, or fails. Same tool, same args — a tool
 implementation fix, not a new version (see `src/VERSIONING.md`).
+
+Settings UI (jay-ai generator) talks to `/api/auth/*` with the stored
+Bearer token — see the `AUTH_CONTRACT.md` "Profile settings" section for
+the exact shapes (password/email/username change, delete, and the
+`localStorage` updates each one needs).
