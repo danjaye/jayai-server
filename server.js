@@ -31,6 +31,13 @@
 //   PUT /api/sync/:collection/:id { updatedAt, data, baseRev? }   -> { id, rev } (+ conflict flag)
 //   DELETE /api/sync/:collection/:id (memories only)             -> { id, rev, deleted }
 //   Full shapes + rules: SYNC_CONTRACT.md.
+//   Trust & safety (v2.5; full rules: MODERATION_CONTRACT.md):
+//   GET  /api/admin/flags[?status=&category=&limit=] (admin)     -> { items: [...] }
+//   POST /api/admin/flags/:id/dismiss (admin)                     -> { ok }
+//   GET  /api/admin/bans (admin)                                 -> { items: [...] }
+//   POST /api/admin/bans { target_type, target, reason, days? } (admin) -> { ok, id }
+//   POST /api/admin/bans/:id/revoke (admin)                      -> { ok }
+//   Banned users/IPs/ranges get 403 { banned:true, reason } on auth+sync.
 //
 // Env (or .env file — see .env.example; process.env wins):
 //   PORT            default 3000
