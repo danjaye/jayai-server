@@ -1,8 +1,13 @@
-# jay-ai sync contract — AGREED v1 (IMPLEMENTED)
+# jay-ai sync contract — AGREED v1 + v8 addendum (IMPLEMENTED)
 
 Goal: chats, memories, and settings follow the account across devices.
-Offline-first: local storage stays the source of truth; the server is a
-backup + relay. Guest mode (no token) never syncs and never prompts.
+The server is the authority (ChatGPT/Claude-style): per-blob revs,
+server-assigned timestamps, last-write-wins, deletes via tombstones.
+Devices are fast caches + offline queues. Guest mode (no token) never syncs
+and never prompts.
+
+(v1 note, kept for history: the server was originally a backup + relay with
+client-set timestamps and no chat deletes. v8 below supersedes that.)
 
 Server half: implemented here. Client half: app helper (jay-ai generator).
 
@@ -13,8 +18,10 @@ Three blob collections. Blob key = `(user, collection, id)`.
 - `chats` — id = chat.id. data = full chat object
   `{ id, title, createdAt, activeRootId, messages: [...] }`.
   Merge rule (client): **union by message.id** (edits/regens only ever ADD
-  nodes, so set-union is safe, no tombstones needed); `title`/`activeRootId`
-  last-write-wins by `updatedAt`. Chats are never deleted by the client.
+  nodes, so set-union is safe); `title`/`activeRootId`/per-node
+  `activeChildId` last-write-wins by server `updatedAt`. Deletes ARE
+  tombstones (v8): a delete on one device removes the chat on every device.
+  Re-PUTing a tombstoned id resurrects it (a normal live blob again).
 - `memories` — id = slug of the file path (`memories/foo-bar.md` → id
   `foo-bar`). data = `{ path, content, updatedAt }`. Merge (client):
   last-write-wins per path by `updatedAt`. Deletes ARE tombstones:
@@ -25,31 +32,36 @@ Three blob collections. Blob key = `(user, collection, id)`.
     updatedAt }`. Merge (client): whole-blob last-write-wins by `updatedAt`.
 - OUT of v1: `images/` binaries (large, need separate upload flow). Phase 2.
 
-Every blob carries client-set `updatedAt` (ms epoch, must be a positive
-number). Server assigns `rev` (monotonic int per blob, starts at 1) and
-stores `bytes` (byte length of the canonical JSON of `data`).
+Every blob carries `updatedAt` (ms epoch). Since v8 the server assigns it from
+the server clock on every PUT/DELETE and returns it — client-sent `updatedAt`
+is still required (positive number, back-compat) but ignored for ordering, so
+device clock skew can never win last-write-wins. Server assigns `rev`
+(monotonic int per blob, starts at 1) and stores `bytes` (byte length of the
+canonical JSON of `data`).
 
 ## Endpoints (all Bearer token, all JSON)
 
 - `GET /api/sync/:collection`
   → `200 { items: [{ id, rev, updatedAt, bytes, deleted? }] }`
-  (manifest; `deleted` only for tombstoned memories). Unknown collection → 404.
+  (manifest; `deleted` only for tombstoned chats/memories). Unknown collection → 404.
 - `GET /api/sync/:collection/:id`
   → `200 { id, rev, updatedAt, data }`. Tombstone → same shape plus
-  `deleted: true` (the stored tombstone data carries the file `path`).
+  `deleted: true` (memories tombstone data carries the file `path`; chats
+  tombstone data is `{ deleted: true, updatedAt }`).
   Missing → 404.
 - `PUT /api/sync/:collection/:id` `{ updatedAt, data, baseRev? }`
-  → `200 { id, rev }`, or
-  `200 { id, rev, conflict: true, server: { rev, updatedAt } }`
+  → `200 { id, rev, updatedAt }` (both server time), or
+  `200 { id, rev, updatedAt, conflict: true, server: { rev, updatedAt } }`
   when `baseRev` is set and no longer current. The server ALWAYS writes
   (last write wins); `server.*` are the POST-write values so the client can
   update its base and pull-merge-repush. `baseRev` omitted/null = blind write,
   never a conflict.
   → `400` bad shape/id; `409` over per-blob size cap; `413` over user quota.
-- `DELETE /api/sync/:collection/:id` → tombstone for `memories`
-  (`200 { id, rev, deleted: true }`); for `chats`/`settings` → `400`
-  (client never deletes those in v1). Missing id → `404`. Tombstone
-  `updatedAt` is server time (DELETE carries no body).
+- `DELETE /api/sync/:collection/:id` → tombstone for `memories` AND `chats`
+  (`200 { id, rev, updatedAt, deleted: true }`); for `settings` → `400`
+  (client never deletes settings). Missing id → `404`. Tombstone
+  `updatedAt` is server time (DELETE carries no body). PUT on a tombstoned id
+  resurrects it as a normal live blob.
 
 Validation: collection ∈ {chats, memories, settings}; id `[A-Za-z0-9_-]{1,128}`
 (the charset alone blocks path traversal; tombstone paths are built
